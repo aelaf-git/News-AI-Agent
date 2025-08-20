@@ -4,8 +4,9 @@ import os
 from dotenv import load_dotenv
 import asyncio
 import time
+from datetime import datetime
 
-# Import the core logic functions from your other file
+# Import the core logic functions
 from agent_logic import (
     get_latest_articles,
     scrape_article_content,
@@ -18,9 +19,8 @@ from agent_logic import (
 load_dotenv()
 
 # --- 1. NEWS SOURCE CONFIGURATION ---
-# A diverse list of 30 news sources from around the world.
-# NOTE: Website structures change! These CSS selectors may need updating over time.
 NEWS_SITES = {
+    # ... (The list of 30 news sites remains unchanged) ...
     # North America
     "AP News": {"url": "https://apnews.com", "selector": ".CardHeadline > a"},
     "CNN": {"url": "https://www.cnn.com", "selector": "a[data-link-type='article']"},
@@ -68,7 +68,6 @@ NEWS_SITES = {
     "The Economist": {"url": "https://www.economist.com/", "selector": "a[data-analytics='hero-click']"},
 }
 
-
 # --- 2. STREAMLIT UI SETUP ---
 st.set_page_config(page_title="Autonomous News Agent", layout="wide")
 st.title("📰 Autonomous News Agent")
@@ -77,124 +76,125 @@ st.markdown("This agent autonomously scrapes news from global sources, summarize
 # Initialize session state for agent control
 if 'running' not in st.session_state:
     st.session_state.running = False
+if 'site_index' not in st.session_state:
+    st.session_state.site_index = 0
+if 'log_messages' not in st.session_state:
+    st.session_state.log_messages = []
+
+def add_log(message):
+    """Adds a timestamped message to the log."""
+    now = datetime.now().strftime("%H:%M:%S")
+    st.session_state.log_messages.insert(0, f"[{now}] {message}")
+    # Keep the log from growing too large
+    if len(st.session_state.log_messages) > 50:
+        st.session_state.log_messages.pop()
 
 # --- Sidebar Controls ---
 st.sidebar.header("Agent Controls")
 
-# Start and Stop buttons
-col1, col2 = st.sidebar.columns(2)
-with col1:
-    if st.button("🚀 Start Agent", use_container_width=True):
+if st.sidebar.button("🚀 Start Agent", use_container_width=True):
+    if not st.session_state.running:
         st.session_state.running = True
-with col2:
-    if st.button("🛑 Stop Agent", use_container_width=True):
+        st.session_state.site_index = 0
+        add_log("Agent started.")
+
+if st.sidebar.button("🛑 Stop Agent", use_container_width=True):
+    if st.session_state.running:
         st.session_state.running = False
+        add_log("Agent stopping...")
 
 # Status indicator
 if st.session_state.running:
-    st.sidebar.success("Agent is running...")
+    st.sidebar.success(f"Agent is running... (Processing site {st.session_state.site_index + 1})")
 else:
     st.sidebar.info("Agent is stopped.")
 
 st.sidebar.header("Media Configuration")
-# Allow user to select which news sites to process
 selected_sites = st.sidebar.multiselect(
     "Select or Exclude News Websites",
     options=list(NEWS_SITES.keys()),
-    default=list(NEWS_SITES.keys())[:5] # Default to first 5 sites
+    default=list(NEWS_SITES.keys())[:10]
 )
 
-
 # --- 3. MAIN AGENT LOOP ---
-# This is the core autonomous logic.
-# It runs only when the 'running' state is True.
+
+# Get API keys once
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
+
+# Check for API keys before starting
+if not all([GROQ_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID]):
+    st.error("🚨 Missing API keys in your .env file! The agent cannot run.")
+    st.session_state.running = False
 
 if st.session_state.running:
-    # Get API keys once
-    GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-    TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-    TELEGRAM_CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")
-
-    # Check for API keys
-    if not all([GROQ_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID]):
-        st.error("🚨 Missing API keys in your .env file! Please add them and restart.")
-        st.session_state.running = False # Stop the agent if keys are missing
+    if not selected_sites:
+        st.warning("No media sources selected. Please select at least one source.")
+        st.session_state.running = False
     else:
-        # Create a placeholder for the agent's live output
-        log_placeholder = st.empty()
+        # Determine which site to process in this cycle
+        # This ensures that even if the user changes the selection, we don't get an error
+        current_index = st.session_state.site_index % len(selected_sites)
+        site_name = selected_sites[current_index]
+        config = NEWS_SITES[site_name]
 
-        # The main autonomous loop
-        while st.session_state.running:
-            log_messages = []
-            log_messages.append("--- Agent Run Started ---")
-            log_placeholder.info("\n".join(log_messages))
+        add_log(f"--- Checking {site_name} ---")
 
-            for site_name in selected_sites:
-                if not st.session_state.running: # Check if stop was pressed during the run
-                    break
+        # --- Run the core logic for one site ---
+        latest_articles = get_latest_articles(config['url'], config['selector'])
+
+        if not latest_articles:
+            add_log(f"No articles found or site error for {site_name}.")
+        else:
+            new_articles_found = 0
+            for article in latest_articles:
+                if has_been_posted(article['url']):
+                    continue # Skip silently to keep log clean
+
+                new_articles_found += 1
+                add_log(f"New article found: '{article['title'][:50]}...'")
                 
-                config = NEWS_SITES[site_name]
-                log_messages.append(f"▶️ Processing {site_name}...")
-                log_placeholder.info("\n".join(log_messages))
-
-                latest_articles = get_latest_articles(config['url'], config['selector'])
-
-                if not latest_articles:
-                    log_messages.append(f"   - No articles found for {site_name}.")
-                    log_placeholder.warning("\n".join(log_messages))
+                content = scrape_article_content(article['url'])
+                if not content or not content['text']:
+                    add_log(f"⚠️ Could not scrape content for article. Skipping.")
                     continue
+                
+                article['image_url'] = content['image_url']
+                summary = summarize_article(GROQ_API_KEY, content['text'], article['title'])
+                
+                if not summary:
+                    add_log(f"⚠️ Summarization failed. Skipping.")
+                    continue
+                
+                success = asyncio.run(post_to_telegram(
+                    TELEGRAM_BOT_TOKEN, TELEGRAM_CHANNEL_ID, summary, article
+                ))
 
-                new_articles_posted = 0
-                for article in latest_articles:
-                    if not st.session_state.running: break
-
-                    if has_been_posted(article['url']):
-                        continue # Skip already posted articles quietly
-                    
-                    log_messages.append(f"   - Found new article: '{article['title'][:40]}...'")
-                    log_placeholder.info("\n".join(log_messages))
-
-                    # Scrape, Summarize, and Post
-                    content = scrape_article_content(article['url'])
-                    if not content or not content['text']:
-                        log_messages.append(f"      - ⚠️ Could not scrape content. Skipping.")
-                        log_placeholder.warning("\n".join(log_messages))
-                        continue
-                    
-                    article['image_url'] = content['image_url']
-                    summary = summarize_article(GROQ_API_KEY, content['text'], article['title'])
-                    
-                    if not summary:
-                        log_messages.append(f"      - ⚠️ Could not summarize. Skipping.")
-                        log_placeholder.warning("\n".join(log_messages))
-                        continue
-                    
-                    success = asyncio.run(post_to_telegram(
-                        TELEGRAM_BOT_TOKEN,
-                        TELEGRAM_CHANNEL_ID,
-                        summary,
-                        article
-                    ))
-
-                    if success:
-                        mark_as_posted(article['url'])
-                        new_articles_posted += 1
-                        log_messages.append(f"      - ✅ Successfully posted to Telegram!")
-                        log_placeholder.success("\n".join(log_messages))
-                    else:
-                        log_messages.append(f"      - ❌ Failed to post to Telegram.")
-                        log_placeholder.error("\n".join(log_messages))
-
-                if new_articles_posted == 0:
-                     log_messages.append(f"   - No new articles to post from {site_name}.")
-                     log_placeholder.info("\n".join(log_messages))
-
-
-            log_messages.append("\n--- Agent Run Finished. Waiting for 1 minute... ---")
-            log_placeholder.info("\n".join(log_messages))
+                if success:
+                    mark_as_posted(article['url'])
+                    add_log(f"✅ Successfully posted '{article['title'][:50]}...'!")
+                else:
+                    add_log(f"❌ Failed to post article.")
             
-            # Wait for 60 seconds before the next run
-            time.sleep(60)
-            
-else:
-    st.info("Agent is currently stopped. Press 'Start Agent' in the sidebar to begin.")
+            if new_articles_found == 0:
+                add_log(f"No new articles to post from {site_name}.")
+
+        # --- Move to the next site for the next cycle ---
+        st.session_state.site_index += 1
+        
+        # Use Streamlit's rerun feature to create an immediate, continuous loop
+        time.sleep(1) # A tiny sleep to prevent maxing out the CPU
+        st.rerun()
+
+# --- 4. DISPLAY LOGS ---
+st.header("Activity Log")
+log_container = st.container(height=500)
+with log_container:
+    for msg in st.session_state.log_messages:
+        if "✅" in msg:
+            st.success(msg)
+        elif "⚠️" in msg or "❌" in msg:
+            st.warning(msg)
+        else:
+            st.info(msg)
