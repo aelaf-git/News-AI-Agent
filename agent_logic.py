@@ -12,16 +12,16 @@ import telegram
 import asyncio
 
 # --- 1. CORE SCRAPING FUNCTIONS ---
-
-# agent_logic.py (replace this function)
+# These functions are the heart of the agent's data gathering capabilities.
 
 def get_latest_articles(site_url, link_selector):
     """
-    Fetches the latest article links from a news homepage, with better filtering.
+    Fetches the latest article links from a news homepage.
+    Filters out non-article links based on title length and uniqueness.
     """
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
     try:
-        response = requests.get(site_url, headers=headers, timeout=10)
+        response = requests.get(site_url, headers=headers, timeout=15)
         response.raise_for_status()
         
         soup = BeautifulSoup(response.content, 'html.parser')
@@ -31,15 +31,14 @@ def get_latest_articles(site_url, link_selector):
             title = link_element.get_text(strip=True)
             href = link_element.get('href')
             
-            # --- BUG FIX ---
-            # 1. Check if title exists and has more than 5 words to filter out junk.
-            # 2. Check if the link is a valid article link (often contains a slug or numbers).
+            # Filter for valid-looking articles: must have a title and a link,
+            # and the title should be more than a few words long.
             if title and href and len(title.split()) > 5:
                 if href not in [a['url'] for a in articles]:
                     full_url = urljoin(site_url, href)
                     articles.append({'title': title, 'url': full_url})
                 
-        return articles[:10]
+        return articles[:10] # Return the top 10 articles found
 
     except requests.RequestException as e:
         print(f"Error fetching homepage {site_url}: {e}")
@@ -47,10 +46,8 @@ def get_latest_articles(site_url, link_selector):
 
 def scrape_article_content(article_url):
     """
-    Scrapes the main text and lead image from a single article page.
-    
-    Returns:
-        A dictionary with 'text' and 'image_url'.
+    Scrapes the main text and a lead image from a single article page.
+    Returns a dictionary containing 'text' and 'image_url'.
     """
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
     try:
@@ -59,18 +56,18 @@ def scrape_article_content(article_url):
         
         soup = BeautifulSoup(response.content, 'html.parser')
         
-        # Extract Text: Find all paragraph tags and join their text
+        # Extract Text: Join all paragraph tags.
         paragraphs = soup.find_all('p')
         article_text = " ".join([p.get_text(strip=True) for p in paragraphs])
 
-        # Extract Image: Find the first prominent image (often in <meta> tags for social sharing)
+        # Extract Image: Look for the Open Graph image tag, which is standard for social sharing.
         image_url = None
         og_image = soup.find('meta', property='og:image')
         if og_image and og_image.get('content'):
             image_url = og_image['content']
         
         if not article_text:
-            return None # Skip if we couldn't find any text
+            return None # Don't proceed if no text could be extracted.
 
         return {'text': article_text, 'image_url': image_url}
 
@@ -79,17 +76,17 @@ def scrape_article_content(article_url):
         return None
 
 # --- 2. SUMMARIZATION WITH LANGCHAIN + GROQ ---
+# This function uses a powerful LLM to summarize the scraped text.
 def summarize_article(groq_api_key, article_text, article_title):
     """
-    Summarizes the article with crash handling and a stricter length prompt.
+    Summarizes the article using a Groq LLM with a specific, concise prompt.
+    Includes error handling for API failures.
     """
     if not article_text: return "Summary could not be generated."
     
     docs = [Document(page_content=article_text)]
     llm = ChatGroq(model_name="llama3-70b-8192", groq_api_key=groq_api_key, temperature=0.5)
     
-    # --- BUG FIX ---
-    # Modified prompt to be more concise for Telegram's caption limit.
     prompt_template = """
 You are a professional news summarizer for an international audience. 
 Your task is to condense the article titled "{article_title}" into a short, neutral, and highly-informative summary.
@@ -113,39 +110,36 @@ SUMMARY:
 """
     prompt = PromptTemplate(template=prompt_template, input_variables=["text", "article_title"])
     
-    # Updated to use .invoke() instead of the deprecated .run()
     chain = load_summarize_chain(llm, chain_type="stuff", prompt=prompt)
     
-    # --- BUG FIX ---
-    # Add try...except block to handle Groq API server errors gracefully.
     try:
-        # We use .invoke() as recommended by the deprecation warning
+        # Use .invoke() as it is the current standard for LangChain.
         summary = chain.invoke({"input_documents": docs, "article_title": article_title})
-        # The output of invoke is a dictionary, so we get the text from the 'output_text' key
         return summary['output_text']
     except Exception as e:
         print(f"Error during summarization with Groq API: {e}")
-        return None # Return None to indicate failure so the app can skip this article.
+        return None # Return None to indicate failure.
 
-# --- 3. TELEGRAM POSTER & STATE MANAGEMENT (Mostly Unchanged) ---
+# --- 3. TELEGRAM POSTER & STATE MANAGEMENT ---
+# These functions handle posting to Telegram and keeping track of what has been posted.
 async def post_to_telegram(bot_token, channel_id, summary, article):
     """
-    Formats and sends the message, truncating the summary if it's too long for a caption.
+    Formats and sends the summarized article to a Telegram channel.
+    Truncates the summary if it exceeds Telegram's caption length limits.
     """
     bot = telegram.Bot(token=bot_token)
     
-    # --- BUG FIX for "Message caption is too long" ---
-    # Define a safe maximum length for the summary itself.
-    # Telegram's limit is 1024. We leave ~150 chars for the title, link, and formatting.
+    # Telegram's caption limit is 1024 chars. We set a safe limit for the summary
+    # to leave room for the title, link, and formatting.
     MAX_SUMMARY_LENGTH = 850
     
     if len(summary) > MAX_SUMMARY_LENGTH:
-        summary = summary[:MAX_SUMMARY_LENGTH] + "..." # Truncate and add ellipsis
+        summary = summary[:MAX_SUMMARY_LENGTH] + "..."
 
     message = f"📰 *{article['title']}*\n\n{summary}\n\n🔗 [Read the full article here]({article['url']})"
 
     try:
-        # Post with a photo if we found one, otherwise post text only
+        # Post with a photo if available, otherwise send a text-only message.
         if article.get('image_url'):
             await bot.send_photo(chat_id=channel_id, photo=article['image_url'], caption=message, parse_mode='Markdown')
         else:
@@ -158,10 +152,12 @@ async def post_to_telegram(bot_token, channel_id, summary, article):
         return False
 
 def has_been_posted(article_url, file_path="posted_articles.txt"):
+    """Checks if a given article URL has already been posted by reading from a log file."""
     if not os.path.exists(file_path): return False
     with open(file_path, 'r') as f:
         return article_url in f.read().splitlines()
 
 def mark_as_posted(article_url, file_path="posted_articles.txt"):
+    """Adds a new article URL to the log file to prevent re-posting."""
     with open(file_path, 'a') as f:
         f.write(f"{article_url}\n")
